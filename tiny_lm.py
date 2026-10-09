@@ -1,5 +1,6 @@
 """The tiny language model: read the last 6 words, score all 58 words for what comes next.
 
+
 6 words -> 6 x 48 = 288 numbers -> l1 -> 512 -> l2 -> 512 -> l3 -> 58 scores.
 Nearly all of its numbers live in four tables: emb (one row per word) and l1, l2, l3.
 """
