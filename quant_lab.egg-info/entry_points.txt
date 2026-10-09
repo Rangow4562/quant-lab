@@ -1,0 +1,3 @@
+[console_scripts]
+quant-lab = experiments:main
+quant-lab-check = selfcheck:main

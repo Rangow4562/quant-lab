@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-lab"
+version = "0.1.0"
+description = "Shrink a tiny language model from 32 to 2 bits per number, one measured experiment at a time."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "quant-lab contributors" }]
+keywords = ["quantization", "language-model", "numpy", "compression", "education"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+quant-lab = "experiments:main"
+quant-lab-check = "selfcheck:main"
+
+[tool.setuptools]
+py-modules = ["bitpack", "tiny_lang", "tiny_lm", "gridquant", "qat", "experiments", "selfcheck"]
