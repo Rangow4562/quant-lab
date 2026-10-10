@@ -1,8 +1,10 @@
 LICENSE
 README.md
 bitpack.py
+calib.py
 experiments.py
 gridquant.py
+methods.py
 pyproject.toml
 qat.py
 selfcheck.py

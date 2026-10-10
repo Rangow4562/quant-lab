@@ -2,8 +2,9 @@ Metadata-Version: 2.4
 Name: quant-lab
 Version: 0.1.0
 Summary: Shrink a tiny language model from 32 to 2 bits per number, one measured experiment at a time.
-Author: quant-lab contributors
+Author: ranjith.kumar
 License: MIT
+Project-URL: Homepage, https://ranjithkumarkn.online
 Keywords: quantization,language-model,numpy,compression,education
 Classifier: Development Status :: 4 - Beta
 Classifier: Intended Audience :: Developers
@@ -26,7 +27,7 @@ Dynamic: license-file
 # quant-lab
 
 **Shrink a tiny language model from 32 bits to 2 bits per number — and watch exactly where it
-breaks, why it breaks, and which four repairs bring it back.**
+breaks, why it breaks, and which repairs bring it back.**
 
 A language model is a long list of numbers stored at 32-bit floating point. Quantization replaces
 every number with a small integer plus one shared scale, cutting the file by an order of magnitude.
@@ -34,7 +35,8 @@ This project makes that process fully observable: it trains a 443,162-parameter 
 language, then squeezes it through a measured pipeline of experiments, each judged by the same
 yardstick — *write 1,000 sentences, count how many exactly match the grammar.*
 
-Pure Python 3 + numpy. No GPU, no frameworks, no black boxes. About 700 lines, every line readable.
+Pure Python 3 + numpy. No GPU, no frameworks, no black boxes. About 1,100 lines, every line
+readable — including working versions of GPTQ, AWQ, SmoothQuant and FP8.
 
 ---
 
@@ -46,6 +48,7 @@ Pure Python 3 + numpy. No GPU, no frameworks, no black boxes. About 700 lines, e
 - [Grid quantization in one page](#grid-quantization-in-one-page)
 - [Why 3 bits breaks](#why-3-bits-breaks)
 - [The four repairs](#the-four-repairs)
+- [The Cast AI guide, method by method](#the-cast-ai-guide-method-by-method)
 - [The experiments](#the-experiments)
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -72,10 +75,19 @@ Pure Python 3 + numpy. No GPU, no frameworks, no black boxes. About 700 lines, e
 | 3 bits, per row + narrowed | — | 794 | `rows` |
 | 3 bits, mixed precision | 0.20 MB | 973 | `mixed` |
 | 2 bits, all repairs + retraining | 0.12 MB | **992** | `qat` |
+| 3 bits, asymmetric grid, per row | — | 954 | `asym` |
+| 3 bits, k-means centres | — | 779 | `kmeans` |
+| 3 bits, one grid per 32 columns | — | 981 | `groups` |
+| 3 bits, AWQ fold + narrowed grids | — | 941 | `awq` |
+| 3 bits, GPTQ error compensation | — | **986** | `gptq` |
+| 8-bit weights, int8 inference (SmoothQuant) | — | 991 | `smooth` |
+| FP8 E4M3 weights (simulated) | — | 989 | `fp8` |
 
 The endpoint: **0.12 MB — 14.4x smaller than the 32-bit file — while writing better sentences
 than the baseline.** The interesting part is the middle of the table: where quality collapses,
-why it collapses, and how each repair buys back grammar at almost no size cost.
+why it collapses, and how each repair buys back grammar at almost no size cost. The rows below
+the line come from the second half of the suite: the same yardstick applied to the quantization
+methods the LLM era actually uses, each measured against its own symmetric baseline.
 
 ## The model
 
@@ -186,6 +198,50 @@ snapped model runs, and its gradients nudge the backstage copy. After 2,000 step
 arrange themselves so three values per table are enough: **992 of 1,000** — better than the
 32-bit baseline. The `l2` distribution settles at -1: 27%, 0: 45%, +1: 28%.
 
+## The Cast AI guide, method by method
+
+The guide that inspired this second half distinguishes the classical tricks (K-means, linear
+grids) from the LLM-era methods (GPTQ, AWQ, SmoothQuant, FP8). All of them now live in
+`methods.py`, all measured by the same 1,000-sentence yardstick, most of them at the same
+3-bit cliff where the original story bottoms out:
+
+- **Asymmetric (zero-point) quantization** — the grid no longer has to sit symmetric around
+  zero; a zero point says which code lands on zero, and `b` bits hold `2**b` codes instead of
+  `2**b - 1`. At 3 bits with one grid per row: **954** of 1,000 (the symmetric pipeline's best
+  static repair is 794). At 2 bits: 95 — the extra code alone is not enough.
+- **K-means quantization** — Deep Compression's move: start from the grid, then let Lloyd's
+  iterations pull each centre to the mean of the numbers it owns, pairs mirrored around zero.
+  At 3 bits: **779** vs 516 for the narrowed grid. At 2 bits only three symmetric centres
+  survive, and no static placement helps: 3 of 1,000 (that is what QAT is for).
+- **Group-wise scales** — the GGML k-quant idea (Q4_K_M and friends): one grid per block of
+  input columns, between per-table and per-row. Per 32 columns at 3 bits: **981** of 1,000,
+  with 13,844 extra scale numbers.
+- **GPTQ** — W4A16 with error compensation. The Hessian H = 2 X^T X, measured on calibration
+  text, says how much each input channel moves the layer's output; columns are quantized in
+  the order that loses least and each column's rounding error is pushed into the columns
+  still waiting. At 3 bits: **986** of 1,000 — within two of the 32-bit baseline, where
+  round-to-nearest per row manages 735. At 2 bits: 231 vs 0.
+- **AWQ** — also W4A16, but the scales come from the activations: per channel,
+  s = max|x|^a / max|w|^(1-a), with a searched per layer so the quantized layer's output
+  drifts least on calibration text. The fold leaves the forward pass unchanged (asserted by
+  a self-check), so only the quantization error changes. At 3 bits: 794 -> **941**.
+- **SmoothQuant** — W8A8. The same fold, but with the difficulty migrated wholesale from
+  activations into weights; then *every* table multiply runs on int8 codes with int32
+  accumulation — real integer inference, not just smaller files. Dynamic per-tensor activation
+  ranges give 986 grammatical sentences but a broken 4.06 loss: a handful of outlier windows
+  steals the range and flattens everyone else — the guide's activation-outlier story, live.
+  Static ranges (chosen once on calibration text, clipping what they clip) give **991** of
+  1,000, loss 1.257.
+- **FP8** — E4M3 and E5M2, simulated as nearest-value rounding in float32 (ties to even,
+  subnormals, saturation or infinity at the top). The floating-point idea at 8 bits keeps
+  dynamic range that int8 has to clip: E4M3 weights give **989** of 1,000 and E5M2 992, both
+  at the 32-bit baseline's loss — better than the 8-bit integer grid's 987.
+
+What is deliberately out of scope, following the guide's own distinctions: **GGUF is a file
+format, not an algorithm** — this project's npz container plays that role, and the block-quant
+idea inside GGML is the group-wise experiment above. **KV-cache quantization** needs attention,
+and this model is a three-layer MLP with no attention to cache.
+
 ## The experiments
 
 | Run | Question | Answer |
@@ -198,6 +254,13 @@ arrange themselves so three values per table are enough: **992 of 1,000** — be
 | `rows` | Repair 2 | Grid per row: 735; also narrowed: 794. |
 | `mixed` | Repair 3 | 3.37 bits on average, 0.20 MB, 973 from the file. |
 | `qat` | Repair 4 | 2 bits: 1 -> 992 after retraining; 0.12 MB, 14.4x smaller. |
+| `asym` | What does a zero point buy? | 3 bits per row: 954 (symmetric best: 794); 2 bits: 95. |
+| `kmeans` | Where should centres live? | Where the numbers are: 779 at 3 bits vs 516 for the narrowed grid. |
+| `groups` | How small can a scale group be? | Per 32 columns at 3 bits: 981; per 64: 967; per row: 794. |
+| `awq` | Which channels matter? | The ones with big activations: 794 -> 941 at 3 bits, 1 -> 168 at 2. |
+| `gptq` | Where should rounding errors go? | Into the columns still waiting: 986 at 3 bits, 231 at 2, vs 735/0. |
+| `smooth` | Can every multiply run on int8? | Yes: 991 of 1,000 with static ranges, 986 with dynamic (outliers steal the range). |
+| `fp8` | What if 8 bits stayed floating point? | E4M3: 989, E5M2: 992 — better than the 8-bit integer grid's 987. |
 
 `python experiments.py all` runs them in narrative order and closes with a recap of the story.
 
@@ -221,9 +284,9 @@ pip install numpy
 run_all.bat             # Windows (double-click friendly)
 
 # or through the installed CLI
-quant-lab-check         # five property checks of the building blocks
+quant-lab-check         # thirteen property checks of the building blocks
 quant-lab all           # the full story
-quant-lab qat           # any single run: baseline bits8 lowbits why clip rows mixed qat
+quant-lab qat           # any single run: baseline bits8 lowbits why clip rows mixed qat asym kmeans groups awq gptq smooth fp8
 ```
 
 The first run trains the model (~1 minute) and caches it in `assets/base.npz`; every later run
@@ -247,11 +310,24 @@ print(lm.grammar_rate(gq.load_shrunk('model.npz')))   # identical to `small`
 
 two_bit = qat.qat_train(params, lm.datasets()[0], gq.Plan(2, tune=True, rows=True),
                         iters=2000, lr=3e-4)
+
+import methods as mt, calib
+
+cal = calib.layer_inputs(params, unseen_words)      # what flows into each table
+model, alphas = mt.awq_model(params, 3, cal)        # activation-aware fold, then quantize
+print(lm.grammar_rate(model))                       # 941 of 1,000 at 3 bits
+print(lm.grammar_rate(mt.gptq_model(params, unseen_words, 3)))   # 986 of 1,000
+
+folded = mt.smooth_model(params, cal)               # SmoothQuant, then int8 all the way
+w8 = mt.quantize_w8(folded)
+print(mt.grammar_rate_w8a8(w8, folded, static={'l1': 1.045, 'l2': 4.193, 'l3': 21.367}))
 ```
 
 A `Plan` is the entire recipe: how many bits per table, whether to search the grid width
 (`tune`), and whether each row gets its own grid (`rows`). Tables left out of a per-table
-`Plan` keep their ordinary numbers.
+`Plan` keep their ordinary numbers. The methods in `methods.py` take the trained model plus
+calibration inputs and hand back a runnable model (or, for W8A8, int8 codes and a forward
+pass that consumes them).
 
 ## Repository layout
 
@@ -266,20 +342,25 @@ quant-lab/
 ├── tiny_lm.py            the model: forward/backward, Adam, training, sampling, the yardstick
 ├── gridquant.py          grids, scales, encode/decode, width search, Plan, file save/load
 ├── bitpack.py            integer codes -> tightly packed bytes -> codes
+├── calib.py              calibration: what flows into each table when the model runs
+├── methods.py            the Cast AI guide, in code: asym, k-means, groups, AWQ, SmoothQuant,
+│                         GPTQ, FP8 — plus the int8 forward pass
 ├── qat.py                training with the rounding inside the loop
-├── experiments.py        the eight runs and the closing recap
-├── selfcheck.py          five property checks of the parts
+├── experiments.py        the fifteen runs and the closing recap
+├── selfcheck.py          thirteen property checks of the parts
 └── assets/               base.npz and every saved artifact (created on first run)
 ```
 
 ## Design notes and limits
 
-- **Disk savings, not compute savings.** Codes are unpacked back to 32-bit floats before running.
-  Real inference engines compute directly on integers; that machinery is out of scope here.
-- **Symmetric grids only.** No zero point, no asymmetric ranges, no group-wise or per-channel
-  block scales beyond whole rows.
-- **Scales are chosen from the weights**, not calibrated on data; calibration is a natural next
-  step (see below).
+- **Disk savings first, compute second.** The original pipeline unpacks codes back to 32-bit
+  floats before running. The one exception is the `smooth` run, whose W8A8 forward pass really
+  accumulates in int32 — the small model does not get faster, but the machinery is honest.
+- **The original pipeline stays symmetric.** `gridquant.py` is untouched: no zero point, no
+  group scales. The asymmetric, k-means, group-wise, activation-aware and FP8 methods live in
+  `methods.py` and are measured in memory rather than through the file pipeline.
+- **Calibration text is fresh, not training text** (`experiments._calibration`), so the
+  activation-aware methods are judged on data they have not seen.
 - **The toy language keeps the signal clean.** With a 58-word grammar, "grammatical" is exact and
   cheap to measure; a real model would report perplexity, and practitioners usually stop at
   4 bits rather than 2.
@@ -289,23 +370,36 @@ quant-lab/
 
 Good next experiments, roughly in order of payoff:
 
-1. **Zero-point (asymmetric) quantization** for skewed distributions.
-2. **Data-calibrated scales**: choose `clip` by minimizing activation error, not weight error.
-3. **Group-wise scales** (e.g. one grid per 64 columns) between per-table and per-row.
-4. **Entropy coding of codes** — the 2-bit `l2` histogram is far from uniform.
-5. **GPTQ-style error compensation**: quantize columns sequentially, pushing each column's error
-   into the not-yet-quantized ones.
-6. **Integer inference**: a matmul over packed codes, so the small model also runs faster.
+1. **Entropy coding of codes** — the 2-bit `l2` histogram is far from uniform.
+2. **Narrowed group grids**: the group-wise experiment uses plain absmax; searching each
+   group's width the way `tune_clip` searches rows should buy more.
+3. **GPTQ with activation ordering and clipping** — the guide's full recipe reorders columns by
+   Hessian diagonal and re-fits scales per block; here only the error feedback is implemented.
+4. **A GGUF-style container** — write the codes, scales and tokenizer into one portable file
+   with the block layouts Q4_K_M uses.
+
+(Implemented from the earlier version of this list: zero-point asymmetric quantization,
+data-calibrated activation-aware scales, group-wise scales, GPTQ-style error compensation,
+and integer inference.)
 
 ## Verification and reproducibility
 
 `selfcheck.py` asserts the properties everything else relies on:
 
 - `decode(encode(w))` never strays more than half a grid step from `w`, at 8/4/3/2 bits;
-- bit packing is exact and achieves `ceil(n * bits / 8)` bytes for widths 8 down to 2;
+- bit packing is exact and achieves `ceil(n * bits / 8)` bytes for widths 8 down to 2, signed
+  and unsigned;
 - with one huge outlier, the width search always finds a narrowed grid that beats the full grid;
 - a saved file reproduces the in-memory shrunk model bit for bit;
-- 2 bits means exactly the codes {-1, 0, +1}.
+- 2 bits means exactly the codes {-1, 0, +1};
+- the asymmetric grid hugs a skewed table tighter than the symmetric one, at half a step;
+- k-means centres stay exactly symmetric and beat the grid on bimodal numbers;
+- group scales beat per-row scales when the spike moves inside the row;
+- folding scales into the weights leaves the forward pass unchanged (AWQ and SmoothQuant both
+  ride on this);
+- GPTQ's compensated reconstruction beats round-to-nearest on the same calibration inputs;
+- the int8 matmul tracks the float one inside the quantization step bound;
+- FP8 casting is idempotent, saturates at 448 on E4M3 and reaches infinity on E5M2.
 
 Every random choice — training, sampling, evaluation — is seeded, and the evaluation seed is
 fixed, so every number in this README regenerates identically: `python selfcheck.py`, then
@@ -313,8 +407,11 @@ fixed, so every number in this README regenerates identically: `python selfcheck
 
 ## Credits and license
 
-An independent implementation of a classic quantization walkthrough, inspired by
-Vuk Rosic's *Quantization from scratch* (MIT licensed). The toy language, the model, the code,
-and the explanations here were written fresh for this project.
+An independent implementation of a classic quantization walkthrough, written by
+[ranjith.kumar](https://ranjithkumarkn.online) and inspired by Vuk Rosic's
+*Quantization from scratch* (MIT licensed). The second half of the suite —
+asymmetric, k-means, group-wise, AWQ, SmoothQuant, GPTQ and FP8 — follows the method map in
+Cast AI's *Demystifying Quantizations: Guide to Quantization Methods for LLMs*. The toy
+language, the model, the code, and the explanations here were written fresh for this project.
 
 Released under the [MIT License](LICENSE).

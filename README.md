@@ -381,8 +381,9 @@ fixed, so every number in this README regenerates identically: `python selfcheck
 
 ## Credits and license
 
-An independent implementation of a classic quantization walkthrough, inspired by
-Vuk Rosic's *Quantization from scratch* (MIT licensed). The second half of the suite —
+An independent implementation of a classic quantization walkthrough, written by
+[ranjith.kumar](https://ranjithkumarkn.online) and inspired by Vuk Rosic's
+*Quantization from scratch* (MIT licensed). The second half of the suite —
 asymmetric, k-means, group-wise, AWQ, SmoothQuant, GPTQ and FP8 — follows the method map in
 Cast AI's *Demystifying Quantizations: Guide to Quantization Methods for LLMs*. The toy
 language, the model, the code, and the explanations here were written fresh for this project.

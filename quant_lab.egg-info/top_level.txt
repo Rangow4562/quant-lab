@@ -1,6 +1,8 @@
 bitpack
+calib
 experiments
 gridquant
+methods
 qat
 selfcheck
 tiny_lang
