@@ -1,9 +1,11 @@
-"""The story in eight runs: measure the model, shrink it, watch it break, repair it, retrain.
+"""The story in fifteen runs: measure the model, shrink it, watch it break, repair it,
+retrain it — then walk the Cast AI guide, method by method.
 
 Usage:  python experiments.py <name>
         python experiments.py all
 
-Runs: baseline, bits8, lowbits, why, clip, rows, mixed, qat
+Runs: baseline, bits8, lowbits, why, clip, rows, mixed, qat,
+      asym, kmeans, groups, awq, gptq, smooth, fp8
 """
 import argparse
 import os
@@ -11,7 +13,9 @@ import time
 
 import numpy as np
 
+import calib
 import gridquant as gq
+import methods as mt
 import qat
 import tiny_lang as tl
 import tiny_lm as lm
@@ -176,8 +180,138 @@ def exp_qat(iters=2000, lr=3e-4):
     return f'{before} -> {good} of 1,000 at 2 bits, {size / 1e6:.2f} MB, {fp32 / size:.1f}x smaller'
 
 
+def _calibration(params, cap=4096):
+    """Fresh, unseen text for the activation-aware methods to calibrate on."""
+    return calib.layer_inputs(params, tl.make_corpus(6000, 5), cap)
+
+
+def exp_asym():
+    params = lm.get_trained()
+    print('one grid per table, symmetric (codes both sides of zero) vs asymmetric (zero point):')
+    last = None
+    for bits in (3, 2):
+        rows = {
+            'symmetric': lm.grammar_rate(gq.compress(params, Plan(bits))),
+            'symmetric, narrowed': lm.grammar_rate(gq.compress(params, Plan(bits, tune=True))),
+        }
+        for label, per_row in (('asymmetric', False), ('asymmetric, per row', True)):
+            tables = {t: mt.decode_asym(*mt.encode_asym(params[t], bits, per_row)) for t in gq.BIG}
+            rows[label] = lm.grammar_rate(mt.with_tables(params, tables))
+        print(f'{bits} bits: ' + ', '.join(f'{k} {v}' for k, v in rows.items()))
+        last = rows
+    return (f'asymmetric grid: {last["asymmetric, per row"]} of 1,000 at 2 bits '
+            f'({last["asymmetric"]} per table, symmetric {last["symmetric"]})')
+
+
+def exp_kmeans():
+    params = lm.get_trained()
+    print('the grid places centres evenly; k-means places them where the numbers are:')
+    last = None
+    for bits in (3, 2):
+        tables = {t: mt.kmeans_decode(*mt.kmeans_encode(params[t], bits)) for t in gq.BIG}
+        rows = {
+            'grid': lm.grammar_rate(gq.compress(params, Plan(bits))),
+            'grid, narrowed': lm.grammar_rate(gq.compress(params, Plan(bits, tune=True))),
+            'k-means': lm.grammar_rate(mt.with_tables(params, tables)),
+        }
+        print(f'{bits} bits: ' + ', '.join(f'{k} {v}' for k, v in rows.items()))
+        last = rows
+    return f'k-means {last["k-means"]} vs grid {last["grid"]} of 1,000 at 2 bits'
+
+
+def exp_groups():
+    params = lm.get_trained()
+    bits = 3
+    print(f'at {bits} bits, one grid per how many input columns:')
+    print('  whole table, narrowed:  ', lm.grammar_rate(gq.compress(params, Plan(bits, tune=True))))
+    print('  one grid per row:       ', lm.grammar_rate(gq.compress(params, Plan(bits, rows=True))))
+    print('  per row, each narrowed: ',
+          lm.grammar_rate(gq.compress(params, Plan(bits, tune=True, rows=True))))
+    last = None
+    for group in (128, 64, 32):
+        tables = {t: mt.decode_grouped(*mt.encode_grouped(params[t], bits, group), params[t].shape[1])
+                  for t in gq.BIG}
+        good = lm.grammar_rate(mt.with_tables(params, tables))
+        scales = sum(s.size for _, s in (mt.encode_grouped(params[t], bits, group) for t in gq.BIG))
+        print(f'  one grid per {group:>3} columns: {good:>4}   ({scales:,} extra scale numbers)')
+        last = good
+    return f'{last} of 1,000 with one grid per 32 columns'
+
+
+def exp_awq():
+    params = lm.get_trained()
+    cal = _calibration(params)
+    print('activation-aware scales (AWQ): protect the channels the model actually uses')
+    last = None
+    for bits in (3, 2):
+        base = lm.grammar_rate(gq.compress(params, Plan(bits, tune=True, rows=True)))
+        model, alphas = mt.awq_model(params, bits, cal)
+        good = lm.grammar_rate(model)
+        print(f'{bits} bits: plain narrowed grids {base} of 1,000; with the AWQ fold {good}'
+              f'   (alphas found: ' + ', '.join(f'{a:.2f}' for a in alphas) + ')')
+        last = good
+    return f'{last} of 1,000 with activation-aware scaling'
+
+
+def exp_gptq():
+    params = lm.get_trained()
+    words = tl.make_corpus(6000, 5)
+    print('round-to-nearest forgets each column\'s error; GPTQ pushes it into the columns '
+          'still waiting')
+    last = None
+    for bits in (3, 2):
+        rows = {
+            'round-to-nearest': lm.grammar_rate(gq.compress(params, Plan(bits, rows=True))),
+            'round-to-nearest, narrowed': lm.grammar_rate(
+                gq.compress(params, Plan(bits, tune=True, rows=True))),
+            'GPTQ': lm.grammar_rate(mt.gptq_model(params, words, bits)),
+        }
+        print(f'{bits} bits: ' + ', '.join(f'{k} {v}' for k, v in rows.items()))
+        last = rows
+    return f'GPTQ {last["GPTQ"]} vs round-to-nearest {last["round-to-nearest"]} of 1,000 at 2 bits'
+
+
+def exp_smooth():
+    params = lm.get_trained()
+    train_text = tl.make_corpus(6000, 5)
+    cal = _calibration(params)
+    folded = mt.smooth_model(params, cal)
+    print(f'the fold alone changes nothing: {lm.grammar_rate(folded)} of 1,000 grammatical')
+    w8 = mt.quantize_w8(folded)
+    static = {name: float(np.abs(x).max())
+              for name, x in calib.layer_inputs(folded, train_text).items()}
+    print('every table multiply now runs on int8 codes with int32 accumulation (W8A8):')
+    rows = {}
+    for label, st in (('dynamic activations', None), ('static activations', static)):
+        good = mt.grammar_rate_w8a8(w8, folded, st)
+        rows[label] = good
+        print(f'  {label}: {good} of 1,000 grammatical, '
+              f'loss {mt.val_loss_w8a8(w8, folded, train_text, st):.3f}')
+    print('  why dynamic loses: a handful of outlier windows push the per-tensor range 250x')
+    print('  wide, and every typical window collapses onto zero: the activation-outlier')
+    print('  problem from the guide, fixed here by static ranges that clip what they clip.')
+    return f'W8A8 int8 inference: {rows["dynamic activations"]} dynamic, {rows["static activations"]} static of 1,000'
+
+
+def exp_fp8():
+    params = lm.get_trained()
+    test_text = lm.datasets()[1]
+    print('FP8 keeps the floating-point idea at 8 bits (Cast AI: the Hopper-native format):')
+    rates = {}
+    for label, fmt in (('E4M3 (range, coarse steps)', mt.FP8_E4M3),
+                       ('E5M2 (wider range, coarser)', mt.FP8_E5M2)):
+        model = mt.with_tables(params, mt.cast_fp8_weights(params, fmt))
+        good = lm.grammar_rate(model)
+        rates[fmt] = good
+        print(f'  {label}: {good} of 1,000 grammatical, loss {lm.val_loss(model, test_text):.3f}')
+    print('for comparison: 8-bit grid 987, 4-bit grid 874 of 1,000')
+    return (f'{rates[mt.FP8_E4M3]} of 1,000 with FP8 E4M3 weights, '
+            f'{rates[mt.FP8_E5M2]} with E5M2')
+
 RUNS = {'baseline': exp_baseline, 'bits8': exp_bits8, 'lowbits': exp_lowbits, 'why': exp_why,
-        'clip': exp_clip, 'rows': exp_rows, 'mixed': exp_mixed, 'qat': exp_qat}
+        'clip': exp_clip, 'rows': exp_rows, 'mixed': exp_mixed, 'qat': exp_qat,
+        'asym': exp_asym, 'kmeans': exp_kmeans, 'groups': exp_groups, 'awq': exp_awq,
+        'gptq': exp_gptq, 'smooth': exp_smooth, 'fp8': exp_fp8}
 
 
 def main():

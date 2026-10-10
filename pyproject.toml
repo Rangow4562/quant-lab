@@ -33,4 +33,4 @@ quant-lab = "experiments:main"
 quant-lab-check = "selfcheck:main"
 
 [tool.setuptools]
-py-modules = ["bitpack", "tiny_lang", "tiny_lm", "gridquant", "qat", "experiments", "selfcheck"]
+py-modules = ["bitpack", "tiny_lang", "tiny_lm", "gridquant", "calib", "methods", "qat", "experiments", "selfcheck"]
